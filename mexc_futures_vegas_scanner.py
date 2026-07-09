@@ -209,6 +209,34 @@ div[data-testid="stSlider"] * { color: #d9f6ff; }
     background: rgba(0,229,255,0.03);
     margin-bottom: 10px;
 }
+
+.tv-link-wrap {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 6px 0 14px 0;
+}
+.tv-link-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 14px;
+    border-radius: 20px;
+    text-decoration: none !important;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    font-weight: 600;
+    border: 1px solid rgba(0,229,255,0.4);
+    background: rgba(0,229,255,0.06);
+    color: #7dffea !important;
+    transition: all 0.15s ease-in-out;
+}
+.tv-link-pill:hover {
+    background: rgba(0,229,255,0.18);
+    box-shadow: 0 0 14px rgba(0,229,255,0.4);
+}
+.tv-link-pill.dir-long { border-color: rgba(0,255,140,0.5); color: #00ff8c !important; }
+.tv-link-pill.dir-short { border-color: rgba(255,77,109,0.5); color: #ff4d6d !important; }
 </style>
 """
 st.markdown(CYBER_CSS, unsafe_allow_html=True)
@@ -279,6 +307,35 @@ def tradingview_url(futures_symbol: str) -> str:
     TradingView上MEXC永續合約的代碼格式為 MEXC:BTCUSDT.P（無底線、結尾加.P）。"""
     tv_symbol = futures_symbol.replace("_", "") + ".P"
     return f"https://www.tradingview.com/chart/?symbol=MEXC%3A{tv_symbol}"
+
+
+def render_tv_link_list(df: pd.DataFrame) -> str:
+    """把交易對清單渲染成一組真正的 HTML <a> 超連結（不是 st.dataframe 內建的 LinkColumn）。
+    st.dataframe 的表格是用 canvas 繪製、連結點擊是透過 JavaScript window.open() 觸發，
+    手機瀏覽器對這種「非使用者直接點擊錨點」的導覽通常不會觸發 iOS/Android 的
+    Universal Link／App Link機制，所以無法自動改用TradingView App開啟。
+    改用真正的 <a href="..."> 標籤，才能讓手機作業系統正確接手、優先用已安裝的App開啟。"""
+    seen = set()
+    items = []
+    for _, row in df.iterrows():
+        sym = row.get("交易對")
+        if sym is None:
+            continue
+        direction = row.get("方向", "")
+        tf = row.get("訊號週期", "")
+        dedup_key = (sym, direction, tf)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        dir_class = "dir-long" if "做多" in str(direction) else ("dir-short" if "做空" in str(direction) else "")
+        name = row.get("幣種名稱", sym)
+        label = f"{name} {direction} {tf}".strip()
+        url = tradingview_url(sym)
+        items.append(f'<a class="tv-link-pill {dir_class}" href="{url}" target="_blank" '
+                     f'rel="noopener noreferrer">📈 {label}</a>')
+    if not items:
+        return '<div class="tv-link-wrap"><span style="color:#8fd7ff;">（無資料）</span></div>'
+    return '<div class="tv-link-wrap">' + "".join(items) + "</div>"
 
 
 # ============================================================
@@ -751,11 +808,11 @@ def analyze_symbol(symbol, raw_by_tf, p, active_directions, apply_market_filter,
 # ============================================================
 st.sidebar.markdown("## 🌐 掃描母體設定（MEXC USDT本位永續合約）")
 top_n = st.sidebar.slider(
-    "依24小時成交額取前 N 名", min_value=20, max_value=500, value=150, step=10,
+    "依24小時成交額取前 N 名", min_value=20, max_value=500, value=200, step=10,
     help="依合約24小時成交額（USDT計價）排序，只掃描前N名，數字越大掃描越完整但也越慢。"
 )
 min_quote_volume_wan = st.sidebar.number_input(
-    "最低24小時成交額門檻 (萬 USDT)", min_value=0.0, value=50.0, step=10.0,
+    "最低24小時成交額門檻 (萬 USDT)", min_value=0.0, value=100.0, step=10.0,
     help="24小時成交額低於此門檻的合約會被排除，用來過濾流動性不足的冷門合約。"
 )
 exclude_stablecoins = st.sidebar.checkbox(
@@ -784,26 +841,26 @@ st.sidebar.markdown("---")
 
 st.sidebar.markdown("## 🎰 維加斯通道參數（統一套用於已勾選的K線級別）")
 lookback_bars_global = st.sidebar.slider(
-    "下載歷史資料根數 (K棒根數)", min_value=200, max_value=2000, value=900, step=50,
+    "下載歷史資料根數 (K棒根數)", min_value=200, max_value=2000, value=2000, step=50,
     help="MEXC合約K線單次最多可取2000根，已勾選的K線級別都會用這個根數下載。"
          "維加斯通道的EMA576/676至少需要數百根K棒才會收斂，建議維持800根以上。"
 )
 min_bars_required = st.sidebar.slider(
-    "最少所需K棒數", min_value=200, max_value=2000, value=700, step=50,
+    "最少所需K棒數", min_value=200, max_value=2000, value=2000, step=50,
     help="資料根數不足此值的週期會直接跳過該週期的訊號判斷（顯示「資料不足」），"
          "避免用尚未收斂的EMA576/676誤判。"
 )
 slope_lookback = st.sidebar.slider(
-    "通道方向判斷回溯根數", min_value=3, max_value=20, value=5, step=1,
+    "通道方向判斷回溯根數", min_value=3, max_value=20, value=10, step=1,
     help="判斷EMA144/169/576/676是否『同方向』時，與這個根數之前的數值比較，"
          "數值越大代表判斷越平滑、越不敏感。此設定同時套用於狀態分類與訊號判斷。"
 )
 pullback_lookback = st.sidebar.slider(
-    "回踩/反彈觀察根數 (前X根)", min_value=3, max_value=30, value=10, step=1,
+    "回踩/反彈觀察根數 (前X根)", min_value=3, max_value=30, value=3, step=1,
     help="在這段根數內，價格必須曾經測試到小通道（EMA144/169）附近或微幅穿越，才符合型態。"
 )
 scan_bars_global = st.sidebar.slider(
-    "訊號偵測範圍 (最近幾根K棒)", min_value=1, max_value=10, value=3, step=1,
+    "訊號偵測範圍 (最近幾根K棒)", min_value=1, max_value=10, value=1, step=1,
     help="只顯示『最近幾根K棒』內出現的訊號，超過這個範圍就視為過期訊號、不會顯示。"
 )
 atr_multiplier = st.sidebar.slider(
@@ -812,7 +869,7 @@ atr_multiplier = st.sidebar.slider(
          "此數字僅供參考，不是投資建議。"
 )
 require_volume_confirm = st.sidebar.checkbox(
-    "訊號當根需符合量能放大倍數", value=False,
+    "訊號當根需符合量能放大倍數", value=True,
     help="維加斯通道系統的原始定義並不強制要求量能，此為可選的額外過濾條件，"
          "勾選後可提高訊號確認度但數量會變少。"
 )
@@ -1059,6 +1116,12 @@ if results is not None:
         df_res_display = df_res_sorted.copy()
         df_res_display["交易對"] = df_res_display["交易對"].apply(tradingview_url)
         st.dataframe(df_res_display, use_container_width=True, hide_index=True, column_config=tv_link_col_config)
+
+        st.markdown("###### 📱 手機快速開啟（點這裡，若已安裝 TradingView App 會優先跳轉開啟）")
+        st.caption("上面表格的連結是在互動表格元件內用JS觸發，手機瀏覽器常常不會交給TradingView App處理，"
+                   "只會用手機瀏覽器打開網頁版。以下改用真正的網頁連結按鈕呈現，手機上點擊時系統才會"
+                   "正確判斷「已安裝TradingView App就優先用App開啟」；電腦瀏覽器點擊則一樣是另開分頁顯示網頁版圖表。")
+        st.markdown(render_tv_link_list(df_res_sorted), unsafe_allow_html=True)
 
         st.download_button(
             label="💾 下載本次掃描結果為 CSV",
