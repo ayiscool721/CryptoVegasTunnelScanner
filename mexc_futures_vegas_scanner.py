@@ -988,18 +988,18 @@ if run_scan:
         status_box.info(f"📥 正在下載 {len(universe)} 個永續合約的 {tf_label} K線資料，"
                          f"首次執行視母體大小可能需要 30 秒至數分鐘...")
 
-        # 四個K線級別的下載改為同時併行送出（各自仍有獨立快取），而非依序逐一等待，
-        # 讓共用的速率限制器隨時保持滿載，減少排程上的閒置時間。
+        # 注意：download_klines_batch 內部被 @st.cache_data 裝飾，Streamlit的快取機制要求
+        # 在主執行緒(ScriptRunContext)下呼叫，不能包在 ThreadPoolExecutor 的背景執行緒裡呼叫
+        # （這樣做會出現"missing ScriptRunContext"警告，且已知會在部分環境下造成崩潰/Segmentation
+        # fault）。四個K線級別因此改回在主執行緒依序呼叫；每個時間週期內部仍會用執行緒池平行
+        # 下載多個交易對的原始K線（那些背景執行緒只呼叫requests/pandas，不會碰觸Streamlit API，
+        # 是安全的），所以掃描速度不會因此變得像完全序列化那樣慢。
         data_by_tf = {}
         fail_counts = {}
-        with ThreadPoolExecutor(max_workers=max(1, len(ACTIVE_TIMEFRAMES))) as tf_executor:
-            tf_futures = {tf_executor.submit(download_klines_batch, universe, tf, lookback_bars_global): tf
-                          for tf in ACTIVE_TIMEFRAMES}
-            for fut in tf_futures:
-                tf = tf_futures[fut]
-                raw_batch = fut.result()
-                fail_counts[tf] = raw_batch.pop("__fail_count__", 0)
-                data_by_tf[tf] = raw_batch
+        for tf in ACTIVE_TIMEFRAMES:
+            raw_batch = download_klines_batch(universe, tf, lookback_bars_global)
+            fail_counts[tf] = raw_batch.pop("__fail_count__", 0)
+            data_by_tf[tf] = raw_batch
 
         status_box.info("⚡ 數據載入完成，正在平行運算維加斯通道指標與訊號...")
 
@@ -1008,7 +1008,7 @@ if run_scan:
             all_scanned_symbols.update(data_dict.keys())
 
         all_hits = []
-        with ThreadPoolExecutor() as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             futures_map = {}
             for symbol in all_scanned_symbols:
                 raw_by_tf = {tf: data_by_tf[tf].get(symbol) for tf in ACTIVE_TIMEFRAMES}
