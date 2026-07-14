@@ -3,24 +3,25 @@
 """
 telegram_vegas_alert.py
 ===================================================================
-維加斯通道 - 多週期完全一致 Telegram 通知腳本
+維加斯通道 - 多週期一致 + 進場訊號 Telegram 通知腳本
 
 這是一支「獨立於 Streamlit App」運作的腳本，設計給 GitHub Actions 排程呼叫
 （建議每15分鐘一次，對齊每個整點的0/15/30/45分），跟你平常用瀏覽器打開的
-Streamlit互動掃描App是兩個完全分開的東西：
-- Streamlit App：你手動點「開始掃描」時才運作，用來「回踩/反彈後站回」的
-  進場訊號做完整篩選。
-- 這支腳本：由GitHub Actions的伺服器主動、無人值守地定期執行，只做一件事：
-  檢查每個交易對的 1D／4H／1H／15m 四個週期，是否「方向完全一致」
-  （四個都是多頭，或四個都是空頭），一致才會推播 Telegram 通知。
+Streamlit互動掃描App是兩個完全分開的東西，但判斷邏輯是完全一致的：
 
-⚠️ 這裡的「訊號」定義跟 Streamlit App 裡的「回踩站回」進場訊號不同，是更單純
-的「多週期方向完全一致」條件，門檻較高但也更嚴格／更少雜訊，適合當作背景
-監控用的粗篩通知，實際進場判斷仍建議搭配App做更完整的訊號確認。
+推播通知需要同時滿足兩個條件：
+1. 【四週期一致】1D／4H／1H／15m 四個週期的維加斯通道狀態必須完全一致
+   （全部是多頭、或全部是空頭），不一致就直接跳過，不檢查下一步。
+2. 【真正的進場訊號】在四週期一致的前提下，1D／4H／1H／15m 之中至少要有一個
+   週期，出現了跟 Streamlit App 完全相同定義的「回踩/反彈後站回」進場事件
+   （價格曾經測試到小通道、目前站回小通道與EMA12之上/之下，且期間未出現
+   確認跌破/突破）。只有「方向一致」但沒有任何週期出現真正進場事件，不會
+   推播通知。
 
-為了避免同一個幣種在持續一致的狀態下，每15分鐘就轟炸你一次通知，這支腳本
-會把「上一次的一致方向」記錄在 alert_state.json 裡，只有在狀態「剛發生改變」
-時（例如從不一致→一致、或從多頭一致→空頭一致）才會真的推播訊息。
+為了避免同一根尚未走完的K棒在每15分鐘檢查時被重複通知，這支腳本會把「每個
+交易對/方向/週期最後一次通知的訊號K棒時間」記錄在 alert_state.json 裡，
+只有偵測到「新的一根K棒」觸發訊號時才會真的推播訊息；同一根K棒在收線之前
+被重複偵測到，不會重複通知。
 
 環境變數（由 GitHub Actions Secrets 提供，不要寫死在程式碼裡）：
 - TELEGRAM_BOT_TOKEN：你的 Telegram Bot Token
@@ -53,6 +54,11 @@ EXCLUDE_NON_CRYPTO = True
 SLOPE_LOOKBACK = 10
 MIN_BARS_REQUIRED = 2000
 LOOKBACK_BARS = 2000
+PULLBACK_LOOKBACK = 3
+SCAN_BARS = 1
+ATR_MULTIPLIER = 1.5
+REQUIRE_VOLUME_CONFIRM = True
+VOL_RATIO_MIN = 1.5
 
 FUTURES_BASE = "https://api.mexc.com"
 STATE_FILE = Path(__file__).resolve().parent / "alert_state.json"
@@ -229,9 +235,19 @@ def build_universe(all_symbols, name_map, ticker_snapshot, top_n, min_quote_volu
     return [r[0] for r in rows[:top_n]]
 
 
-def compute_ema_only(df: pd.DataFrame) -> pd.DataFrame:
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.sort_index().copy()
-    for span in (144, 169, 576, 676):
+    df["Vol_MA5"] = df["Volume"].rolling(5).mean()
+
+    prev_close = df["Close"].shift(1)
+    tr = pd.concat([
+        df["High"] - df["Low"],
+        (df["High"] - prev_close).abs(),
+        (df["Low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    df["ATR14"] = tr.rolling(14).mean()
+
+    for span in (12, 144, 169, 576, 676):
         df[f"EMA{span}"] = df["Close"].ewm(span=span, adjust=False).mean()
     return df
 
@@ -264,20 +280,135 @@ def classify_tunnel_status(df: pd.DataFrame, slope_lookback: int) -> str:
     return "range"
 
 
+def fmt_price(x):
+    if x is None or pd.isna(x):
+        return "—"
+    ax = abs(float(x))
+    if ax == 0:
+        return "0"
+    if ax >= 1:
+        return f"{x:,.4f}"
+    elif ax >= 0.01:
+        return f"{x:,.6f}"
+    else:
+        return f"{x:,.8f}"
+
+
+def strat_vegas_entry_signal(df: pd.DataFrame, direction: str):
+    """完整移植自 Streamlit App 的維加斯通道「回踩/反彈後站回」進場訊號判斷。
+    回傳 None，或 dict：{"signal_time", "close", "v_ratio", "stop_ref", "note"}。"""
+    n = len(df)
+    if n < MIN_BARS_REQUIRED:
+        return None
+    if df[["EMA144", "EMA169", "EMA576", "EMA676", "EMA12"]].iloc[-1].isna().any():
+        return None
+
+    small_up = df[["EMA144", "EMA169"]].max(axis=1)
+    small_low = df[["EMA144", "EMA169"]].min(axis=1)
+    small_mid = df[["EMA144", "EMA169"]].mean(axis=1)
+    large_mid = df[["EMA576", "EMA676"]].mean(axis=1)
+
+    slope_n = SLOPE_LOOKBACK
+
+    def is_trending(idx):
+        if idx - slope_n < 0:
+            return False
+        if pd.isna(small_mid.iloc[idx]) or pd.isna(large_mid.iloc[idx]):
+            return False
+        if direction == "long" and not (small_mid.iloc[idx] > large_mid.iloc[idx]):
+            return False
+        if direction == "short" and not (small_mid.iloc[idx] < large_mid.iloc[idx]):
+            return False
+        for col in ("EMA144", "EMA169", "EMA576", "EMA676"):
+            prev_v = df[col].iloc[idx - slope_n]
+            cur_v = df[col].iloc[idx]
+            if pd.isna(prev_v) or pd.isna(cur_v):
+                return False
+            if direction == "long" and cur_v <= prev_v:
+                return False
+            if direction == "short" and cur_v >= prev_v:
+                return False
+        return True
+
+    min_i = PULLBACK_LOOKBACK + slope_n + 1
+    for i in range(n - SCAN_BARS, n):
+        if i < min_i:
+            continue
+        row = df.iloc[i]
+        if pd.isna(row["EMA12"]) or pd.isna(small_up.iloc[i]) or pd.isna(small_low.iloc[i]):
+            continue
+
+        if direction == "long":
+            if not (row["Close"] > small_up.iloc[i] and row["Close"] > row["EMA12"]):
+                continue
+        else:
+            if not (row["Close"] < small_low.iloc[i] and row["Close"] < row["EMA12"]):
+                continue
+
+        if not is_trending(i - 1):
+            continue
+
+        lo = max(0, i - PULLBACK_LOOKBACK)
+        window_high = df["High"].iloc[lo:i]
+        window_low = df["Low"].iloc[lo:i]
+        window_close = df["Close"].iloc[lo:i]
+        window_small_up = small_up.iloc[lo:i]
+        window_small_low = small_low.iloc[lo:i]
+        window_ema12 = df["EMA12"].iloc[lo:i]
+        if window_high.empty:
+            continue
+
+        if direction == "long":
+            touched = (window_low <= window_small_up).any()
+        else:
+            touched = (window_high >= window_small_low).any()
+        if not touched:
+            continue
+
+        if direction == "long":
+            confirmed_break = ((window_close < window_small_low) & (window_close < window_ema12)).any()
+        else:
+            confirmed_break = ((window_close > window_small_up) & (window_close > window_ema12)).any()
+        if confirmed_break:
+            continue
+
+        v_ratio = row["Volume"] / row["Vol_MA5"] if row["Vol_MA5"] > 0 else 1.0
+        if REQUIRE_VOLUME_CONFIRM and v_ratio < VOL_RATIO_MIN:
+            continue
+
+        atr = df["ATR14"].iloc[-1]
+        close_now = float(row["Close"])
+        if pd.notna(atr):
+            stop_ref = close_now - ATR_MULTIPLIER * float(atr) if direction == "long" \
+                else close_now + ATR_MULTIPLIER * float(atr)
+        else:
+            stop_ref = None
+
+        action = "回踩後站回小通道" if direction == "long" else "反彈後再度跌落小通道"
+        note = f"{action}，前{PULLBACK_LOOKBACK}根內測試過小通道，量能放大{round(v_ratio,2)}倍"
+        return {
+            "signal_time": row.name,
+            "close": close_now,
+            "v_ratio": v_ratio,
+            "stop_ref": stop_ref,
+            "note": note,
+        }
+    return None
+
+
 def fetch_all_timeframes(symbol):
-    """回傳 (symbol, {tf: status}, last_close)。任何一個週期資料不足就整組視為無法判斷。"""
+    """回傳 (symbol, {tf: df}, {tf: status})。任何一個週期資料不足就整組視為無法判斷。"""
+    dfs = {}
     statuses = {}
-    last_close = None
     for tf in TIMEFRAME_ORDER:
         cfg = TIMEFRAME_CONFIG[tf]
         raw = fetch_futures_klines_raw(symbol, cfg["interval"], LOOKBACK_BARS, cfg["seconds"])
         if raw is None or len(raw) < MIN_BARS_REQUIRED:
             return symbol, None, None
-        df = compute_ema_only(raw)
+        df = compute_indicators(raw)
+        dfs[tf] = df
         statuses[tf] = classify_tunnel_status(df, SLOPE_LOOKBACK)
-        if tf == "15M":
-            last_close = float(df["Close"].iloc[-1])
-    return symbol, statuses, last_close
+    return symbol, dfs, statuses
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
@@ -325,41 +456,66 @@ def main():
     old_state = load_state()
     new_state = {}
     alerts = []
-    checked, skipped = 0, 0
+    checked, skipped, aligned_count = 0, 0, 0
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(fetch_all_timeframes, sym) for sym in universe]
         for fut in futures:
-            symbol, statuses, last_close = fut.result()
+            symbol, dfs, statuses = fut.result()
             checked += 1
             if statuses is None:
                 skipped += 1
                 continue
 
+            # 條件一：1D/4H/1H/15M 四個週期通道狀態必須完全一致（全多頭或全空頭）
             aligned = None
             if all(statuses[tf] == "bull" for tf in TIMEFRAME_ORDER):
                 aligned = "bull"
             elif all(statuses[tf] == "bear" for tf in TIMEFRAME_ORDER):
                 aligned = "bear"
+            if aligned is None:
+                continue
+            aligned_count += 1
+            direction = "long" if aligned == "bull" else "short"
 
-            if aligned is not None:
-                new_state[symbol] = aligned
-                prev = old_state.get(symbol)
-                if prev != aligned:
-                    base = name_map.get(symbol, symbol.split("_")[0])
-                    dir_label = "🟢 全週期多頭一致" if aligned == "bull" else "🔴 全週期空頭一致"
-                    price_str = f"{last_close:,.6f}" if last_close is not None else "—"
-                    msg = (
-                        f"*{dir_label}*\n"
-                        f"合約：`{symbol}` ({base})\n"
-                        f"現價：{price_str} USDT\n"
-                        f"1D／4H／1H／15M 通道狀態皆為{'多頭' if aligned == 'bull' else '空頭'}\n"
-                        f"⚠️ 純技術面多週期一致通知，非投資建議，請自行確認風險"
-                    )
-                    alerts.append(msg)
+            # 條件二：在這個一致的環境下，至少一個週期要出現真正的「回踩/反彈後站回」進場訊號
+            fired_timeframes = []
+            for tf in TIMEFRAME_ORDER:
+                hit = strat_vegas_entry_signal(dfs[tf], direction)
+                if hit is None:
+                    continue
+                state_key = f"{symbol}|{direction}|{tf}"
+                signal_time_str = str(hit["signal_time"])
+                new_state[state_key] = signal_time_str
+                # 只有「這根K棒的訊號」跟上次通知過的不是同一根，才真正推播，
+                # 避免同一根尚未走完的K棒被15分鐘檢查週期重複通知。
+                if old_state.get(state_key) != signal_time_str:
+                    fired_timeframes.append((tf, hit))
+
+            if not fired_timeframes:
+                continue
+
+            base = name_map.get(symbol, symbol.split("_")[0])
+            dir_label = "🟢 做多進場訊號" if direction == "long" else "🔴 做空進場訊號"
+            status_line = "／".join(f"{tf}:{'多頭' if statuses[tf]=='bull' else '空頭'}" for tf in TIMEFRAME_ORDER)
+            tf_detail_lines = []
+            for tf, hit in fired_timeframes:
+                stop_str = fmt_price(hit["stop_ref"]) if hit["stop_ref"] is not None else "—"
+                tf_detail_lines.append(
+                    f"　• {TIMEFRAME_CONFIG[tf]['label']}：{hit['note']}\n"
+                    f"　  觸發時間 {hit['signal_time']}　現價 {fmt_price(hit['close'])}　ATR停損參考 {stop_str}"
+                )
+            msg = (
+                f"*{dir_label}*\n"
+                f"合約：`{symbol}` ({base})\n"
+                f"四週期狀態：{status_line}（已全部一致）\n"
+                f"觸發進場條件的週期：\n" + "\n".join(tf_detail_lines) + "\n"
+                f"⚠️ 純技術面訊號，非投資建議，請自行確認風險與資金管理"
+            )
+            alerts.append(msg)
 
     print(f"檢查完成：共檢查 {checked} 個合約，{skipped} 個因資料不足被跳過，"
-          f"{len(new_state)} 個目前處於多週期一致狀態，其中 {len(alerts)} 個是新產生的一致狀態。")
+          f"{aligned_count} 個目前四週期方向一致，其中 {len(alerts)} 個出現新的進場訊號。")
 
     for msg in alerts:
         send_telegram_message(token, chat_id, msg)
