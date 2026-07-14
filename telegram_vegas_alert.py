@@ -397,18 +397,22 @@ def strat_vegas_entry_signal(df: pd.DataFrame, direction: str):
 
 
 def fetch_all_timeframes(symbol):
-    """回傳 (symbol, {tf: df}, {tf: status})。任何一個週期資料不足就整組視為無法判斷。"""
+    """回傳 (symbol, {tf: df}或None, {tf: status}或None, fail_reason, fail_tf)。
+    fail_reason: None(成功) / "fetch_fail"(抓取失敗，可能是網路或限速問題) /
+    "insufficient_bars"(有抓到資料但根數不足，通常是該合約上市時間不夠長，屬正常情況)。"""
     dfs = {}
     statuses = {}
     for tf in TIMEFRAME_ORDER:
         cfg = TIMEFRAME_CONFIG[tf]
         raw = fetch_futures_klines_raw(symbol, cfg["interval"], LOOKBACK_BARS, cfg["seconds"])
-        if raw is None or len(raw) < MIN_BARS_REQUIRED:
-            return symbol, None, None
+        if raw is None:
+            return symbol, None, None, "fetch_fail", tf
+        if len(raw) < MIN_BARS_REQUIRED:
+            return symbol, None, None, "insufficient_bars", tf
         df = compute_indicators(raw)
         dfs[tf] = df
         statuses[tf] = classify_tunnel_status(df, SLOPE_LOOKBACK)
-    return symbol, dfs, statuses
+    return symbol, dfs, statuses, None, None
 
 
 def send_telegram_message(token: str, chat_id: str, text: str) -> bool:
@@ -456,15 +460,18 @@ def main():
     old_state = load_state()
     new_state = {}
     alerts = []
-    checked, skipped, aligned_count = 0, 0, 0
+    checked, aligned_count = 0, 0
+    fail_reason_counts = {"fetch_fail": 0, "insufficient_bars": 0}
+    fail_reason_by_tf = {"fetch_fail": {}, "insufficient_bars": {}}
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         futures = [executor.submit(fetch_all_timeframes, sym) for sym in universe]
         for fut in futures:
-            symbol, dfs, statuses = fut.result()
+            symbol, dfs, statuses, fail_reason, fail_tf = fut.result()
             checked += 1
-            if statuses is None:
-                skipped += 1
+            if fail_reason is not None:
+                fail_reason_counts[fail_reason] += 1
+                fail_reason_by_tf[fail_reason][fail_tf] = fail_reason_by_tf[fail_reason].get(fail_tf, 0) + 1
                 continue
 
             # 條件一：1D/4H/1H/15M 四個週期通道狀態必須完全一致（全多頭或全空頭）
@@ -514,8 +521,36 @@ def main():
             )
             alerts.append(msg)
 
-    print(f"檢查完成：共檢查 {checked} 個合約，{skipped} 個因資料不足被跳過，"
-          f"{aligned_count} 個目前四週期方向一致，其中 {len(alerts)} 個出現新的進場訊號。")
+    skipped_total = fail_reason_counts["fetch_fail"] + fail_reason_counts["insufficient_bars"]
+    diag_line = (
+        f"檢查完成：共檢查 {checked} 個合約，{skipped_total} 個被跳過"
+        f"（其中「抓取失敗/可能限速」{fail_reason_counts['fetch_fail']} 個，"
+        f"「歷史資料不足2000根」{fail_reason_counts['insufficient_bars']} 個），"
+        f"{aligned_count} 個目前四週期方向一致，其中 {len(alerts)} 個出現新的進場訊號。"
+    )
+    print(diag_line)
+    if fail_reason_by_tf["insufficient_bars"]:
+        print("「歷史資料不足」依週期分布：", fail_reason_by_tf["insufficient_bars"],
+              "（通常1D佔多數是正常的，因為要求2000根日線=2000天歷史，多數合約上市沒那麼久）")
+    if fail_reason_by_tf["fetch_fail"]:
+        print("「抓取失敗」依週期分布：", fail_reason_by_tf["fetch_fail"],
+              "（若這個數字偏高，才比較可能是限速或網路問題）")
+
+    # -------------------------------------------------------------
+    # 除錯用「心跳」訊息：本次沒有任何新訊號時，仍發一則簡短通知，
+    # 方便確認排程真的有在跑（而不是無聲無息、你也不知道是沒訊號還是整個沒執行）。
+    # 之後如果覺得沒訊號也要收到通知太吵，把 SEND_HEARTBEAT_WHEN_NO_SIGNAL 改成 False 即可。
+    # -------------------------------------------------------------
+    SEND_HEARTBEAT_WHEN_NO_SIGNAL = True
+    if not alerts and SEND_HEARTBEAT_WHEN_NO_SIGNAL:
+        heartbeat_msg = (
+            f"🔕 *當前無交易訊號*\n"
+            f"本次掃描時間：{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}\n"
+            f"共檢查 {checked} 個合約，{aligned_count} 個四週期方向一致，但沒有新的進場訊號。\n"
+            f"（跳過：抓取失敗 {fail_reason_counts['fetch_fail']} 個／歷史資料不足 {fail_reason_counts['insufficient_bars']} 個）\n"
+            f"系統運作正常，此為確認排程有執行的提示訊息。"
+        )
+        send_telegram_message(token, chat_id, heartbeat_msg)
 
     for msg in alerts:
         send_telegram_message(token, chat_id, msg)
